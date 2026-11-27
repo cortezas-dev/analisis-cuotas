@@ -1,6 +1,11 @@
 """
 📊 Panel de Cuotas y Partidos — Streamlit + The Odds API
 Listo para desplegar en Streamlit Community Cloud (share.streamlit.io) vía GitHub.
+
+Novedades de esta versión:
+  1. Opción «Todos los deportes (Agenda del día)» con la mejor apuesta de cada partido.
+  2. Columna «Fecha y hora» en Análisis conservador y Simulador.
+  3. Mercados extra opcionales (totals_h1, btts, team_totals) con aviso de créditos.
 """
 
 import html as htmllib
@@ -25,6 +30,7 @@ st.set_page_config(
 API_BASE = "https://api.the-odds-api.com/v4"
 BEST = "⭐ Mejor cuota (todas las casas)"
 OTHER = "🏅 Otros deportes"
+AGENDA = "🌍 Todos los deportes (Agenda del día)"
 GROUP_MAP = {
     "Soccer": "⚽ Fútbol",
     "Basketball": "🏀 Baloncesto",
@@ -32,12 +38,33 @@ GROUP_MAP = {
     "Tennis": "🎾 Tenis",
 }
 CATEGORY_ORDER = ["⚽ Fútbol", "🏀 Baloncesto", "⚾ Béisbol", "🎾 Tenis", OTHER]
-MARKET_LABELS = {
+
+MAIN_MARKETS = {
     "h2h": "Ganador (1X2 / Moneyline)",
     "totals": "Totales (Over/Under)",
     "spreads": "Hándicap (Spread)",
 }
-MARKET_SHORT = {"h2h": "1X2/ML", "totals": "O/U", "spreads": "HC"}
+EXTRA_MARKETS = {
+    "totals_h1": "Totales 1.ª mitad (Over/Under)",
+    "btts": "Ambos equipos marcan (BTTS)",
+    "team_totals": "Totales por equipo (Over/Under)",
+}
+MARKET_LABELS = {**MAIN_MARKETS, **EXTRA_MARKETS}
+MARKET_SHORT = {
+    "h2h": "1X2/ML", "totals": "O/U", "spreads": "HC",
+    "totals_h1": "1H O/U", "btts": "BTTS", "team_totals": "TT O/U",
+}
+# Deportes en los que tiene sentido pedir cada mercado extra (evita gastar créditos en balde)
+EXTRA_SUPPORT = {
+    "btts": {"Soccer"},
+    "totals_h1": {"Soccer", "Basketball", "American Football"},
+    "team_totals": {"Soccer", "Basketball", "Baseball", "Ice Hockey", "American Football"},
+}
+# Competiciones que se preseleccionan en la agenda (solo las que estén activas en la API)
+PREFERRED_AGENDA = [
+    "soccer_spain_la_liga", "soccer_spain_segunda_division", "soccer_uefa_champs_league",
+    "basketball_nba", "basketball_euroleague", "baseball_mlb", "soccer_epl",
+]
 DIAS = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
 TIMEZONES = [
     "Europe/Madrid",
@@ -81,7 +108,17 @@ def eur(x: float) -> str:
 
 
 def fmt_dt(dt) -> str:
+    """Formato corto para tarjetas: jue 26/11 · 21:00"""
     return f"{DIAS[dt.weekday()]} {dt:%d/%m} · {dt:%H:%M}"
+
+
+def fmt_dt_full(dt) -> str:
+    """Formato completo para tablas: jue 26/11/2026 · 21:00"""
+    return f"{DIAS[dt.weekday()]} {dt:%d/%m/%Y} · {dt:%H:%M}"
+
+
+def parse_ts(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def category_of(group: str) -> str:
@@ -95,11 +132,24 @@ def get_secret_key() -> str:
         return ""
 
 
+def agenda_window(mode: str, tz: ZoneInfo):
+    """Ventana temporal de la agenda en la zona horaria elegida."""
+    now = datetime.now(tz)
+    midnight = datetime.combine(now.date(), datetime.min.time(), tzinfo=tz)
+    if mode == "Hoy":
+        return now, midnight + timedelta(days=1)
+    if mode == "Mañana":
+        return midnight + timedelta(days=1), midnight + timedelta(days=2)
+    return now, now + timedelta(hours=24)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # THE ODDS API
 # ──────────────────────────────────────────────────────────────────────────────
 class OddsAPIError(Exception):
-    pass
+    def __init__(self, message: str, fatal: bool = False):
+        super().__init__(message)
+        self.fatal = fatal  # fatal = no tiene sentido seguir consultando (clave inválida, sin créditos)
 
 
 def _api_get(path: str, api_key: str, params: dict | None = None):
@@ -110,11 +160,11 @@ def _api_get(path: str, api_key: str, params: dict | None = None):
         raise OddsAPIError(f"Error de conexión con The Odds API: {exc}") from exc
 
     if r.status_code == 401:
-        raise OddsAPIError("API Key no válida o desactivada. Revísala en the-odds-api.com.")
+        raise OddsAPIError("API Key no válida o desactivada. Revísala en the-odds-api.com.", fatal=True)
     if r.status_code == 429:
-        raise OddsAPIError("Has superado el límite de peticiones o de créditos de tu plan.")
-    if r.status_code == 422:
-        raise OddsAPIError("422")
+        raise OddsAPIError("Has superado el límite de peticiones o de créditos de tu plan.", fatal=True)
+    if r.status_code in (404, 422):
+        raise OddsAPIError(str(r.status_code))
     if not r.ok:
         raise OddsAPIError(f"Error {r.status_code}: {r.text[:200]}")
     return r.json(), r.headers.get("x-requests-remaining")
@@ -144,12 +194,46 @@ def fetch_odds(api_key: str, sport_key: str, region: str):
                 },
             )
         except OddsAPIError as exc:
-            if str(exc) != "422":
-                raise
-            last_error = exc
+            if str(exc) == "422":
+                last_error = exc
+                continue
+            if str(exc) == "404":
+                raise OddsAPIError("Competición no encontrada o sin partidos.") from exc
+            raise
     raise OddsAPIError(
         "Esta competición no tiene cuotas disponibles ahora mismo para los mercados solicitados."
     ) from last_error
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_event_market(api_key: str, sport_key: str, event_id: str, region: str, market: str):
+    """Mercado adicional de UN partido (endpoint /events/{id}/odds). Se cobra por mercado devuelto."""
+    try:
+        data, remaining = _api_get(
+            f"/sports/{sport_key}/events/{event_id}/odds",
+            api_key,
+            {"regions": region, "markets": market, "oddsFormat": "decimal", "dateFormat": "iso"},
+        )
+    except OddsAPIError as exc:
+        if str(exc) in ("404", "422"):  # mercado no disponible para ese partido
+            return [], None
+        raise
+    books = data.get("bookmakers", []) if isinstance(data, dict) else []
+    return books, remaining
+
+
+def merge_extra(ev: dict, extra_bookmakers: list[dict]) -> None:
+    """Añade los mercados extra a las casas del evento (o crea la casa si no existía)."""
+    by_key = {b["key"]: b for b in ev.get("bookmakers", [])}
+    for eb in extra_bookmakers:
+        if not eb.get("markets"):
+            continue
+        if eb["key"] in by_key:
+            by_key[eb["key"]].setdefault("markets", []).extend(eb["markets"])
+        else:
+            new_book = {"key": eb["key"], "title": eb.get("title", eb["key"]), "markets": list(eb["markets"])}
+            ev.setdefault("bookmakers", []).append(new_book)
+            by_key[eb["key"]] = new_book
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -261,7 +345,9 @@ def generate_demo_events(sport_key: str) -> list[dict]:
     events = []
     for i in range(n_events):
         home, away = rng.sample(teams, 2)
-        kickoff = base + timedelta(hours=rng.randint(3, 160), minutes=rng.choice([0, 15, 30, 45]))
+        # ~45 % de los partidos caen en las próximas 20 h para que la agenda del día tenga contenido
+        hours = rng.randint(1, 20) if rng.random() < 0.45 else rng.randint(1, 160)
+        kickoff = base + timedelta(hours=hours, minutes=rng.choice([0, 15, 30, 45]))
 
         if is_soccer:
             p_home = rng.uniform(0.25, 0.62)
@@ -316,47 +402,128 @@ def generate_demo_events(sport_key: str) -> list[dict]:
     return sorted(events, key=lambda e: e["commence_time"])
 
 
+def _h1_lines(sport_key: str, group: str):
+    if group == "Soccer":
+        return [(0.5, 0.70), (1.5, 0.36)]
+    if group == "Basketball":
+        return [((78.5 if "euroleague" in sport_key else 110.5), 0.5)]
+    if group == "American Football":
+        return [(21.5, 0.5)]
+    return []
+
+
+def _team_lines(sport_key: str, group: str):
+    if group == "Soccer":
+        return [(0.5, 0.72), (1.5, 0.38)]
+    if group == "Basketball":
+        return [((82.5 if "euroleague" in sport_key else 112.5), 0.5)]
+    if group == "Baseball":
+        return [(4.5, 0.5)]
+    if group == "Ice Hockey":
+        return [(2.5, 0.5)]
+    if group == "American Football":
+        return [(23.5, 0.5)]
+    return []
+
+
+def demo_extra_bookmakers(ev: dict, group: str, markets: list[str]) -> list[dict]:
+    """Mercados extra ficticios (misma estructura que el endpoint /events/{id}/odds)."""
+    rng = random.Random(f"{ev['id']}-extra")
+    sk, home, away = ev["sport_key"], ev["home_team"], ev["away_team"]
+    p_yes = rng.uniform(0.42, 0.62)
+    jitter = {home: rng.uniform(-0.05, 0.05), away: rng.uniform(-0.05, 0.05)}
+
+    out = []
+    for bkey, btitle, margin in DEMO_BOOKS:
+        mks = []
+        if "btts" in markets and group in EXTRA_SUPPORT["btts"]:
+            mks.append({"key": "btts", "outcomes": [
+                {"name": "Yes", "price": _book_odds(p_yes, margin, rng)},
+                {"name": "No", "price": _book_odds(1 - p_yes, margin, rng)},
+            ]})
+        if "totals_h1" in markets and group in EXTRA_SUPPORT["totals_h1"]:
+            outs = []
+            for line, p in _h1_lines(sk, group):
+                outs.append({"name": "Over", "price": _book_odds(p, margin, rng), "point": line})
+                outs.append({"name": "Under", "price": _book_odds(1 - p, margin, rng), "point": line})
+            if outs:
+                mks.append({"key": "totals_h1", "outcomes": outs})
+        if "team_totals" in markets and group in EXTRA_SUPPORT["team_totals"]:
+            outs = []
+            for team in (home, away):
+                for line, p in _team_lines(sk, group):
+                    p_over = min(0.9, max(0.1, p + jitter[team]))
+                    outs.append({"name": "Over", "description": team,
+                                 "price": _book_odds(p_over, margin, rng), "point": line})
+                    outs.append({"name": "Under", "description": team,
+                                 "price": _book_odds(1 - p_over, margin, rng), "point": line})
+            if outs:
+                mks.append({"key": "team_totals", "outcomes": outs})
+        if mks:
+            out.append({"key": bkey, "title": btitle, "markets": mks})
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # PROCESADO DE CUOTAS
 # ──────────────────────────────────────────────────────────────────────────────
-def _selection_name(mkey: str, name: str, home: str, point, is_soccer: bool) -> str:
+def _selection_name(mkey: str, o: dict, home: str, is_soccer: bool) -> str:
+    name, point = o["name"], o.get("point")
     if mkey == "h2h":
         if name.lower() == "draw":
             return "Empate (X)"
         if name == home:
             return f"{name} (1 · Local)" if is_soccer else f"{name} (Local)"
         return f"{name} (2 · Visitante)" if is_soccer else f"{name} (Visitante)"
+    if mkey == "btts":
+        return "Ambos marcan: Sí" if name.lower() == "yes" else "Ambos marcan: No"
+    side = "Más de" if name.lower() == "over" else "Menos de"
     if mkey == "totals":
-        label = "Más de" if name.lower() == "over" else "Menos de"
-        return f"{label} {point:g}"
-    return f"{name} {point:+g}"
+        return f"{side} {point:g}"
+    if mkey == "totals_h1":
+        return f"{side} {point:g} (1.ª mitad)"
+    if mkey == "team_totals":
+        return f"{o.get('description') or 'Equipo'}: {side} {point:g}"
+    return f"{name} {point:+g}"  # spreads
 
 
-def _order(mkey: str, name: str, home: str) -> int:
-    if mkey == "totals":
+def _order(mkey: str, o: dict, home: str) -> int:
+    name = o["name"]
+    if mkey == "btts":
+        return 0 if name.lower() == "yes" else 1
+    if mkey in ("totals", "totals_h1"):
         return 0 if name.lower() == "over" else 1
+    if mkey == "team_totals":
+        return (0 if o.get("description") == home else 2) + (0 if name.lower() == "over" else 1)
     if name == home:
         return 0
     return 1 if name.lower() == "draw" else 2
 
 
 def market_name(group: str, mkey: str) -> str:
+    unit = {
+        "Soccer": "goles", "Basketball": "puntos", "Baseball": "carreras",
+        "Tennis": "juegos", "Ice Hockey": "goles", "American Football": "puntos",
+    }.get(group, "puntos/goles")
     if mkey == "h2h":
         return "Resultado final (1X2)" if group == "Soccer" else "Ganador del partido (Moneyline)"
     if mkey == "totals":
-        unit = {
-            "Soccer": "goles", "Basketball": "puntos", "Baseball": "carreras",
-            "Tennis": "juegos", "Ice Hockey": "goles", "American Football": "puntos",
-        }.get(group, "puntos/goles")
         return f"Total de {unit} (Over/Under)"
+    if mkey == "totals_h1":
+        return f"Total de {unit} 1.ª mitad (Over/Under)"
+    if mkey == "btts":
+        return "Ambos equipos marcan (BTTS)"
+    if mkey == "team_totals":
+        return f"Total de {unit} por equipo (Over/Under)"
     return "Hándicap asiático" if group == "Soccer" else "Hándicap / Spread"
 
 
 def build_selections(events: list[dict], tz: ZoneInfo, bookmaker: str, league: str, group: str) -> pd.DataFrame:
     is_soccer = group == "Soccer"
+    needs_point = {"totals", "totals_h1", "team_totals", "spreads"}
     rows = []
     for ev in events:
-        kickoff = datetime.fromisoformat(ev["commence_time"].replace("Z", "+00:00")).astimezone(tz)
+        kickoff = parse_ts(ev["commence_time"]).astimezone(tz)
         home, away = ev["home_team"], ev["away_team"]
         for bk in ev.get("bookmakers", []):
             if bookmaker != BEST and bk["title"] != bookmaker:
@@ -369,21 +536,25 @@ def build_selections(events: list[dict], tz: ZoneInfo, bookmaker: str, league: s
                     price = o.get("price")
                     if not price or price <= 1:
                         continue
-                    point = o.get("point")
+                    if mkey in needs_point and o.get("point") is None:
+                        continue
                     rows.append({
                         "event_id": ev["id"],
                         "Grupo": group,
+                        "Deporte": category_of(group),
                         "Liga": league,
                         "Partido": f"{home} vs {away}",
                         "Local": home,
                         "Inicio": kickoff,
+                        "Fecha y hora": fmt_dt_full(kickoff),
                         "mkey": mkey,
                         "Mercado": market_name(group, mkey),
-                        "Selección": _selection_name(mkey, o["name"], home, point, is_soccer),
-                        "Línea": point,
+                        "Selección": _selection_name(mkey, o, home, is_soccer),
+                        "Línea": o.get("point"),
+                        "Equipo": o.get("description") if mkey == "team_totals" else None,
                         "Cuota": float(price),
                         "Casa": bk["title"],
-                        "orden": _order(mkey, o["name"], home),
+                        "orden": _order(mkey, o, home),
                     })
     df = pd.DataFrame(rows)
     if df.empty:
@@ -398,12 +569,22 @@ def build_selections(events: list[dict], tz: ZoneInfo, bookmaker: str, league: s
     )
     df["Prob (%)"] = 1 / df["Cuota"] * 100  # probabilidad implícita
 
-    # Probabilidad "sin margen" aproximada (normalizando cada mercado/línea)
+    # Probabilidad "sin margen" aproximada (normalizando cada mercado/línea/equipo)
     df["_grp"] = df["Línea"].abs().fillna(-1)
-    g = df.groupby(["event_id", "mkey", "_grp"])["Prob (%)"]
+    df["_team"] = df["Equipo"].fillna("")
+    g = df.groupby(["event_id", "mkey", "_team", "_grp"])["Prob (%)"]
     total, count = g.transform("sum"), g.transform("count")
     df["Prob sin margen (%)"] = (df["Prob (%)"] / total * 100).where(count >= 2)
-    return df.drop(columns="_grp")
+    return df.drop(columns=["_grp", "_team"])
+
+
+def best_pick_per_event(df: pd.DataFrame, min_odds: float) -> pd.DataFrame:
+    """Selección con mayor probabilidad de cada partido (entre todos los mercados cargados)."""
+    cand = df[df["Cuota"] >= min_odds]
+    if cand.empty:
+        return cand
+    idx = cand.groupby("event_id")["Prob (%)"].idxmax()
+    return cand.loc[idx].sort_values("Inicio")
 
 
 def balanced_line(sub: pd.DataFrame) -> pd.DataFrame:
@@ -413,6 +594,14 @@ def balanced_line(sub: pd.DataFrame) -> pd.DataFrame:
     tmp = sub.assign(_k=sub["Línea"].abs())
     spreads = tmp.groupby("_k")["Cuota"].agg(lambda s: s.max() - s.min() if len(s) > 1 else 99)
     return tmp[tmp["_k"] == spreads.idxmin()].drop(columns="_k").sort_values("orden")
+
+
+def team_block(sub: pd.DataFrame) -> pd.DataFrame:
+    """Totales por equipo: línea principal de cada equipo."""
+    if sub.empty:
+        return sub
+    parts = [balanced_line(sub[sub["Equipo"] == t]) for t in sub["Equipo"].dropna().unique()]
+    return pd.concat(parts).sort_values("orden") if parts else sub
 
 
 def chips_html(rows: pd.DataFrame) -> str:
@@ -430,29 +619,47 @@ def chips_html(rows: pd.DataFrame) -> str:
 def render_event_card(ev_df: pd.DataFrame):
     first = ev_df.iloc[0]
     with st.container(border=True):
-        st.markdown(f"**{first['Partido']}**  \n🕒 {fmt_dt(first['Inicio'])} · _{first['Liga']}_")
-        cols = st.columns(3)
-        blocks = [
-            ("h2h", "Ganador", ev_df[ev_df.mkey == "h2h"].sort_values("orden")),
-            ("totals", "Over / Under", balanced_line(ev_df[ev_df.mkey == "totals"])),
-            ("spreads", "Hándicap", balanced_line(ev_df[ev_df.mkey == "spreads"])),
+        st.markdown(
+            f"**{first['Partido']}**  \n🕒 {fmt_dt(first['Inicio'])} · _{first['Deporte']} · {first['Liga']}_"
+        )
+        main = [
+            ("Ganador", ev_df[ev_df.mkey == "h2h"].sort_values("orden")),
+            ("Over / Under", balanced_line(ev_df[ev_df.mkey == "totals"])),
+            ("Hándicap", balanced_line(ev_df[ev_df.mkey == "spreads"])),
         ]
-        for col, (_, title, sub) in zip(cols, blocks):
-            with col:
-                st.markdown(f'<div class="mk-title">{title}</div>{chips_html(sub)}', unsafe_allow_html=True)
+        if any(not sub.empty for _, sub in main):
+            for col, (title, sub) in zip(st.columns(3), main):
+                with col:
+                    st.markdown(f'<div class="mk-title">{title}</div>{chips_html(sub)}',
+                                unsafe_allow_html=True)
+
+        extra = [
+            ("Ambos marcan", ev_df[ev_df.mkey == "btts"].sort_values("orden")),
+            ("Over / Under 1.ª mitad", balanced_line(ev_df[ev_df.mkey == "totals_h1"])),
+            ("Totales por equipo", team_block(ev_df[ev_df.mkey == "team_totals"])),
+        ]
+        extra = [(title, sub) for title, sub in extra if not sub.empty]
+        if extra:
+            for col, (title, sub) in zip(st.columns(len(extra)), extra):
+                with col:
+                    st.markdown(f'<div class="mk-title">{title}</div>{chips_html(sub)}',
+                                unsafe_allow_html=True)
 
 
 ALT_NAMES = {
     "h2h": '"1X2", "Match Winner", "Moneyline" o "Ganador del partido"',
     "totals": '"Total", "Más/Menos" u "Over/Under"',
     "spreads": '"Hándicap", "Spread" o "Línea"',
+    "totals_h1": '"1.ª mitad – Total de goles/puntos" u "Over/Under 1st Half"',
+    "btts": '"Ambos equipos marcan", "Both Teams To Score" o "BTTS"',
+    "team_totals": '"Total del equipo", "Team Totals" o "Goles/puntos del equipo"',
 }
 
 
 def steps_md(row: pd.Series) -> str:
     return (
         f"1. Abre tu casa de apuestas y ve a **{row['Liga']}**.\n"
-        f"2. Busca el partido **{row['Partido']}** ({fmt_dt(row['Inicio'])}).\n"
+        f"2. Busca el partido **{row['Partido']}** ({row['Fecha y hora']}).\n"
         f"3. Abre el mercado **{row['Mercado']}** (también puede llamarse {ALT_NAMES[row['mkey']]}).\n"
         f"4. Elige **{row['Selección']}** — cuota de referencia **{row['Cuota']:.2f}** "
         f"(la mejor encontrada: {row['Casa']}).\n"
@@ -505,98 +712,284 @@ if not categories:
     st.error("No se han encontrado competiciones activas.")
     st.stop()
 
-category = st.sidebar.selectbox("Deporte", categories)
-leagues = sorted(by_category[category], key=lambda s: s["title"])
-league_titles = {s["key"]: s["title"] for s in leagues}
-league_groups = {s["key"]: s["group"] for s in leagues}
-sport_key = st.sidebar.selectbox("Competición", list(league_titles), format_func=lambda k: league_titles.get(k, k))
+category = st.sidebar.selectbox("Deporte", [AGENDA] + categories, index=1)
+is_agenda = category == AGENDA
+
+if is_agenda:
+    agenda_titles = {
+        s["key"]: f"{category_of(s['group'])} · {s['title']}"
+        for s in sorted(sports, key=lambda s: (CATEGORY_ORDER.index(category_of(s["group"])), s["title"]))
+    }
+    if use_demo:
+        default_keys = list(agenda_titles)
+    else:
+        default_keys = [k for k in PREFERRED_AGENDA if k in agenda_titles][:4]
+    selected_keys = st.sidebar.multiselect(
+        "Competiciones de la agenda", list(agenda_titles), default=default_keys,
+        format_func=lambda k: agenda_titles.get(k, k), max_selections=12,
+    )
+    agenda_day = st.sidebar.selectbox("Día de la agenda", ["Hoy", "Mañana", "Próximas 24 horas"])
+    metas = [s for s in sports if s["key"] in selected_keys]
+    if not use_demo:
+        st.sidebar.warning(
+            f"⚠️ La agenda consulta cada competición seleccionada: hasta 3 créditos por competición "
+            f"(≈ {len(metas) * 3} ahora)."
+        )
+else:
+    leagues = sorted(by_category[category], key=lambda s: s["title"])
+    league_titles = {s["key"]: s["title"] for s in leagues}
+    sport_key = st.sidebar.selectbox("Competición", list(league_titles),
+                                     format_func=lambda k: league_titles.get(k, k))
+    metas = [next(s for s in leagues if s["key"] == sport_key)]
 
 tz_name = st.sidebar.selectbox("Zona horaria", TIMEZONES, index=0)
 tz = ZoneInfo(tz_name)
-horizon = st.sidebar.slider("Partidos de los próximos … días", 1, 14, 7)
+if not is_agenda:
+    horizon = st.sidebar.slider("Partidos de los próximos … días", 1, 14, 7)
 
-# Carga de partidos
+# ── Carga de partidos ────────────────────────────────────────────────────────
+if is_agenda and not metas:
+    st.markdown(
+        '<div class="hero"><h1>📊 Panel de Cuotas y Partidos</h1>'
+        "<p>Elige al menos una competición para construir la agenda.</p></div>",
+        unsafe_allow_html=True,
+    )
+    st.info("Selecciona competiciones en la barra lateral.")
+    st.stop()
+
+events_by_sport: dict[str, list[dict]] = {}
+skipped: list[tuple[str, str]] = []
+remaining = None
 with st.spinner("Cargando partidos y cuotas…"):
-    try:
-        if use_demo:
-            raw_events, remaining = generate_demo_events(sport_key), None
-        else:
-            raw_events, remaining = fetch_odds(api_key, sport_key, region)
-    except OddsAPIError as exc:
-        st.error(f"❌ {exc}")
-        st.stop()
+    for meta in metas:
+        try:
+            if use_demo:
+                evs, rem = generate_demo_events(meta["key"]), None
+            else:
+                evs, rem = fetch_odds(api_key, meta["key"], region)
+        except OddsAPIError as exc:
+            if exc.fatal or not is_agenda:
+                st.error(f"❌ {exc}")
+                st.stop()
+            skipped.append((meta["title"], str(exc)))
+            continue
+        if rem is not None:
+            remaining = rem
+        events_by_sport[meta["key"]] = evs
 
-now_utc = datetime.now(timezone.utc)
-limit_utc = now_utc + timedelta(days=horizon)
-events = [
-    e for e in raw_events
-    if now_utc <= datetime.fromisoformat(e["commence_time"].replace("Z", "+00:00")) <= limit_utc
-]
+if is_agenda:
+    w_start, w_end = agenda_window(agenda_day, tz)
+else:
+    w_start = datetime.now(timezone.utc)
+    w_end = w_start + timedelta(days=horizon)
+for k, evs in events_by_sport.items():
+    events_by_sport[k] = [e for e in evs if w_start <= parse_ts(e["commence_time"]) <= w_end]
 
-bookmakers_available = sorted({b["title"] for e in events for b in e.get("bookmakers", [])})
+bookmakers_available = sorted({
+    b["title"] for evs in events_by_sport.values() for e in evs for b in e.get("bookmakers", [])
+})
 bookmaker = st.sidebar.selectbox("Casa de apuestas", [BEST] + bookmakers_available)
+
+# ── Mercados extra (opcional) ────────────────────────────────────────────────
+st.sidebar.divider()
+extra_sel = st.sidebar.multiselect(
+    "Mercados extra (opcional)", list(EXTRA_MARKETS), format_func=EXTRA_MARKETS.get,
+    help="Se piden partido a partido (endpoint /events/{id}/odds) y solo existen en algunas casas "
+         "y deportes. Si no hay datos, simplemente no aparecen.",
+)
+extra_events_loaded = 0
+if extra_sel:
+    max_extra_events = int(st.sidebar.number_input("Máx. partidos con mercados extra", 1, 30, 5))
+    eligible = sorted(
+        [(meta, ev) for meta in metas for ev in events_by_sport.get(meta["key"], [])],
+        key=lambda t: t[1]["commence_time"],
+    )
+    plan = []
+    for meta, ev in eligible:
+        mk = [m for m in extra_sel if meta["group"] in EXTRA_SUPPORT[m]]
+        if mk:
+            plan.append((meta, ev, mk))
+    plan = plan[:max_extra_events]
+    max_credits = sum(len(mk) for _, _, mk in plan)
+
+    do_fetch = bool(plan)
+    if use_demo:
+        st.sidebar.caption("🧪 En modo demostración los mercados extra son ficticios y no gastan créditos.")
+    else:
+        st.sidebar.warning(
+            f"⚠️ Cada mercado extra se cobra por partido: 1 crédito por mercado devuelto y región. "
+            f"Para {len(plan)} partidos, hasta **{max_credits} créditos** adicionales "
+            f"(solo se cobran los mercados con datos)."
+        )
+        do_fetch = bool(plan) and st.sidebar.checkbox("Confirmo el consumo de créditos", value=False)
+
+    if do_fetch:
+        with st.spinner("Cargando mercados extra…"):
+            stop_extra = False
+            for meta, ev, mk in plan:
+                if use_demo:
+                    merge_extra(ev, demo_extra_bookmakers(ev, meta["group"], mk))
+                    continue
+                for m in mk:
+                    try:
+                        books, rem = fetch_event_market(api_key, meta["key"], ev["id"], region, m)
+                    except OddsAPIError as exc:
+                        st.sidebar.error(f"❌ Mercados extra: {exc}")
+                        stop_extra = True
+                        break
+                    if rem is not None:
+                        remaining = rem
+                    merge_extra(ev, books)
+                if stop_extra:
+                    break
+        extra_events_loaded = sum(
+            1 for _, ev, _ in plan
+            if any(m["key"] in EXTRA_MARKETS for b in ev.get("bookmakers", []) for m in b.get("markets", []))
+        )
+        st.sidebar.caption(f"Mercados extra encontrados en **{extra_events_loaded}** de {len(plan)} partidos.")
+    elif not plan:
+        st.sidebar.caption("Ningún partido de la selección admite esos mercados extra.")
 
 if remaining is not None:
     st.sidebar.caption(f"Créditos restantes de la API: **{remaining}**")
 if not use_demo:
-    st.sidebar.caption("Cada consulta consume 1 crédito por mercado y región (hasta 3).")
+    st.sidebar.caption("Cada consulta de cuotas consume 1 crédito por mercado y región (hasta 3).")
 if st.sidebar.button("🔄 Actualizar datos"):
     st.cache_data.clear()
     st.rerun()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CABECERA
+# CABECERA Y DATAFRAME PRINCIPAL
 # ──────────────────────────────────────────────────────────────────────────────
+subtitle = (
+    f"🌍 Todos los deportes · {agenda_day} · horario {tz_name}"
+    if is_agenda
+    else f"{category} · {metas[0]['title']} · horario {tz_name}"
+)
 st.markdown(
-    f'<div class="hero"><h1>📊 Panel de Cuotas y Partidos</h1>'
-    f"<p>{category} · {league_titles[sport_key]} · horario {tz_name}</p></div>",
+    f'<div class="hero"><h1>📊 Panel de Cuotas y Partidos</h1><p>{subtitle}</p></div>',
     unsafe_allow_html=True,
 )
 if use_demo:
     st.info("🧪 **Modo demostración**: las cuotas son ficticias y solo sirven para probar la app.")
+if skipped:
+    with st.expander(f"⚠️ {len(skipped)} competición(es) sin datos"):
+        for title, msg in skipped:
+            st.write(f"**{title}**: {msg}")
 
-df = build_selections(events, tz, bookmaker, league_titles[sport_key], league_groups[sport_key])
+frames = []
+for meta in metas:
+    evs = events_by_sport.get(meta["key"], [])
+    if not evs:
+        continue
+    frame = build_selections(evs, tz, bookmaker, meta["title"], meta["group"])
+    if not frame.empty:
+        frames.append(frame)
+df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
 if df.empty:
-    st.warning("No hay partidos con cuotas en este rango. Prueba con más días u otra competición.")
+    if is_agenda:
+        st.warning("No hay partidos con cuotas para ese día en las competiciones elegidas. "
+                   "Prueba con «Mañana», «Próximas 24 horas» o añade más competiciones.")
+    else:
+        st.warning("No hay partidos con cuotas en este rango. Prueba con más días u otra competición.")
     st.stop()
 
-tab_matches, tab_analysis, tab_sim, tab_guide = st.tabs(
-    ["📅 Partidos y cuotas", "🎯 Análisis conservador", "💶 Simulador", "📚 Guía de mercados"]
-)
+tab_matches, tab_analysis, tab_sim, tab_guide = st.tabs([
+    "🗓️ Agenda del día" if is_agenda else "📅 Partidos y cuotas",
+    "🎯 Análisis conservador",
+    "💶 Simulador",
+    "📚 Guía de mercados",
+])
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TAB 1 · PARTIDOS
+# TAB 1 · AGENDA DEL DÍA / PARTIDOS
 # ──────────────────────────────────────────────────────────────────────────────
 with tab_matches:
-    markets_view = st.multiselect(
-        "Mercados a mostrar", list(MARKET_LABELS), default=list(MARKET_LABELS),
-        format_func=MARKET_LABELS.get, key="mk_view",
-    )
-    view = st.radio("Vista", ["Tarjetas", "Tabla"], horizontal=True)
-
-    n_events = df["event_id"].nunique()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Partidos", n_events)
-    c2.metric("Selecciones con cuota", len(df))
-    c3.metric("Casas de apuestas", len(bookmakers_available) if bookmaker == BEST else 1)
-
-    view_df = df[df["mkey"].isin(markets_view)]
-    if view == "Tarjetas":
-        for ev_id in view_df.drop_duplicates("event_id").sort_values("Inicio")["event_id"]:
-            render_event_card(view_df[view_df["event_id"] == ev_id])
-    else:
-        table = view_df.sort_values(["Inicio", "Partido", "mkey", "orden"]).copy()
-        table["Fecha"] = table["Inicio"].dt.strftime("%d/%m/%Y")
-        table["Hora"] = table["Inicio"].dt.strftime("%H:%M")
-        st.dataframe(
-            table[["Fecha", "Hora", "Partido", "Mercado", "Selección", "Cuota", "Prob (%)", "Casa"]],
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "Cuota": st.column_config.NumberColumn(format="%.2f"),
-                "Prob (%)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
-            },
+    if is_agenda:
+        a1, a2 = st.columns([3, 2])
+        markets_view = a1.multiselect(
+            "Mercados analizados", list(MARKET_LABELS), default=list(MARKET_LABELS),
+            format_func=MARKET_LABELS.get, key="mk_view",
         )
+        agenda_min = a2.slider(
+            "Cuota mínima de la apuesta", 1.01, 2.00, 1.10, step=0.01,
+            help="Evita apuestas con cuota casi 1.00 que apenas pagan.",
+        )
+        view_df = df[df["mkey"].isin(markets_view)]
+        picks = best_pick_per_event(view_df, agenda_min)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Partidos en la agenda", df["event_id"].nunique())
+        c2.metric("Con apuesta sugerida", len(picks))
+        c3.metric("Competiciones", df["Liga"].nunique())
+
+        if picks.empty:
+            st.info("Ningún partido tiene una selección que cumpla la cuota mínima en esos mercados.")
+        else:
+            ag = picks.copy()
+            ag["Deporte / Liga"] = ag["Deporte"] + " · " + ag["Liga"]
+            ag["Apuesta (mayor prob.)"] = ag["Selección"]
+            ag["Prob. (%)"] = ag["Prob (%)"]
+            ag["Acción exacta"] = ag.apply(
+                lambda r: f"Mercado «{r['Mercado']}» → elegir «{r['Selección']}»", axis=1
+            )
+            ag = ag.rename(columns={"Fecha y hora": "Día y hora"})
+            st.dataframe(
+                ag[["Día y hora", "Deporte / Liga", "Partido", "Apuesta (mayor prob.)",
+                    "Cuota", "Prob. (%)", "Acción exacta"]],
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Cuota": st.column_config.NumberColumn(format="%.2f"),
+                    "Prob. (%)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
+                },
+            )
+            st.caption("Ordenado por hora. La apuesta de cada fila es la selección con mayor probabilidad "
+                       "implícita entre los mercados marcados, con la mejor cuota encontrada. "
+                       "Probabilidad alta no significa que vaya a ganar.")
+
+            pos = st.selectbox(
+                "🧭 Ver paso a paso de…", list(range(len(picks))),
+                format_func=lambda i: f"{ag.iloc[i]['Día y hora']} · {ag.iloc[i]['Partido']}",
+            )
+            st.markdown(steps_md(picks.iloc[pos]))
+
+        with st.expander("Ver todas las cuotas de la agenda (tarjetas)"):
+            ids = view_df.drop_duplicates("event_id").sort_values("Inicio")["event_id"].tolist()
+            for ev_id in ids[:30]:
+                render_event_card(view_df[view_df["event_id"] == ev_id])
+            if len(ids) > 30:
+                st.caption(f"Mostrando 30 de {len(ids)} partidos.")
+    else:
+        markets_view = st.multiselect(
+            "Mercados a mostrar", list(MARKET_LABELS), default=list(MARKET_LABELS),
+            format_func=MARKET_LABELS.get, key="mk_view",
+        )
+        view = st.radio("Vista", ["Tarjetas", "Tabla"], horizontal=True)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Partidos", df["event_id"].nunique())
+        c2.metric("Selecciones con cuota", len(df))
+        c3.metric("Casas de apuestas", len(bookmakers_available) if bookmaker == BEST else 1)
+
+        view_df = df[df["mkey"].isin(markets_view)]
+        if view == "Tarjetas":
+            for ev_id in view_df.drop_duplicates("event_id").sort_values("Inicio")["event_id"]:
+                render_event_card(view_df[view_df["event_id"] == ev_id])
+        else:
+            table = view_df.sort_values(["Inicio", "Partido", "mkey", "orden"]).copy()
+            table["Fecha"] = table["Inicio"].dt.strftime("%d/%m/%Y")
+            table["Hora"] = table["Inicio"].dt.strftime("%H:%M")
+            st.dataframe(
+                table[["Fecha", "Hora", "Partido", "Mercado", "Selección", "Cuota", "Prob (%)", "Casa"]],
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Cuota": st.column_config.NumberColumn(format="%.2f"),
+                    "Prob (%)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
+                },
+            )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TAB 2 · ANÁLISIS CONSERVADOR
@@ -629,10 +1022,11 @@ with tab_analysis:
     else:
         show = ranking.copy()
         show.insert(0, "#", range(1, len(show) + 1))
-        show["Fecha y hora"] = show["Inicio"].map(fmt_dt)
+        show["Deporte / Liga"] = show["Deporte"] + " · " + show["Liga"]
+        cols = ["#", "Fecha y hora"] + (["Deporte / Liga"] if is_agenda else []) + [
+            "Partido", "Mercado", "Selección", "Cuota", "Prob (%)", "Prob sin margen (%)", "Casa"]
         st.dataframe(
-            show[["#", "Fecha y hora", "Partido", "Mercado", "Selección", "Cuota",
-                  "Prob (%)", "Prob sin margen (%)", "Casa"]],
+            show[cols],
             width="stretch",
             hide_index=True,
             column_config={
@@ -653,7 +1047,7 @@ with tab_analysis:
         for i, (_, row) in enumerate(ranking.head(10).iterrows(), start=1):
             with st.expander(
                 f"{i}. {row['Partido']} → {row['Selección']} @ {row['Cuota']:.2f} "
-                f"({row['Prob (%)']:.1f}%)"
+                f"({row['Prob (%)']:.1f}%) · {row['Fecha y hora']}"
             ):
                 st.markdown(steps_md(row))
 
@@ -668,11 +1062,14 @@ with tab_sim:
         st.info("Ajusta los filtros de la pestaña de análisis para tener selecciones que simular.")
     else:
         st.markdown("**Apuestas simples** (las del ranking)")
-        sim = ranking[["Partido", "Selección", "Cuota", "Prob (%)"]].copy()
+        sim = ranking.copy()
+        sim["Deporte / Liga"] = sim["Deporte"] + " · " + sim["Liga"]
         sim["Retorno total"] = (stake * sim["Cuota"]).round(2)
         sim["Beneficio neto"] = (sim["Retorno total"] - stake).round(2)
+        sim_cols = ["Fecha y hora"] + (["Deporte / Liga"] if is_agenda else []) + [
+            "Partido", "Selección", "Cuota", "Prob (%)", "Retorno total", "Beneficio neto"]
         st.dataframe(
-            sim, width="stretch", hide_index=True,
+            sim[sim_cols], width="stretch", hide_index=True,
             column_config={
                 "Cuota": st.column_config.NumberColumn(format="%.2f"),
                 "Prob (%)": st.column_config.NumberColumn(format="%.1f%%"),
@@ -684,24 +1081,29 @@ with tab_sim:
         st.markdown("**Apuesta combinada**")
         combo_pool = pool.copy()
         combo_pool["Etiqueta"] = combo_pool.apply(
-            lambda r: f"{r['Partido']} — {r['Selección']} @ {r['Cuota']:.2f} [{MARKET_SHORT[r['mkey']]}]",
+            lambda r: f"{r['Fecha y hora']} · {r['Partido']} — {r['Selección']} "
+                      f"@ {r['Cuota']:.2f} [{MARKET_SHORT[r['mkey']]}]",
             axis=1,
         )
         combo_pool = combo_pool.drop_duplicates("Etiqueta").set_index("Etiqueta")
-        default_labels = [
-            lbl for lbl in
+        default_labels = list(
             combo_pool.reset_index().drop_duplicates("event_id")["Etiqueta"].head(3)
-        ]
+        )
         chosen = st.multiselect("Elige las selecciones de tu combinada", list(combo_pool.index),
                                 default=default_labels)
 
         if len(chosen) >= 2:
-            picks = combo_pool.loc[chosen]
-            if picks["event_id"].duplicated().any():
+            picks_c = combo_pool.loc[chosen]
+            if picks_c["event_id"].duplicated().any():
                 st.warning("⚠️ Has elegido varias selecciones del mismo partido: las casas suelen "
                            "no permitirlo en una combinada.")
-            combo_odds = float(picks["Cuota"].prod())
-            combo_prob = float((picks["Prob (%)"] / 100).prod() * 100)
+            st.dataframe(
+                picks_c[["Fecha y hora", "Partido", "Selección", "Cuota"]].reset_index(drop=True),
+                width="stretch", hide_index=True,
+                column_config={"Cuota": st.column_config.NumberColumn(format="%.2f")},
+            )
+            combo_odds = float(picks_c["Cuota"].prod())
+            combo_prob = float((picks_c["Prob (%)"] / 100).prod() * 100)
             ret = stake * combo_odds
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Cuota combinada", f"{combo_odds:.2f}")
@@ -725,7 +1127,8 @@ with tab_guide:
 
 ### 🛡️ Doble oportunidad (fútbol)
 Cubres dos de los tres resultados: **1X** (local gana o empata), **X2** (visitante gana o empata) o **12** (no hay empate).
-Las cuotas son más bajas porque es más probable, pero esta app no las muestra: búscalas en tu casa de apuestas.
+Las cuotas son más bajas porque es más probable. The Odds API lo ofrece como mercado adicional (`double_chance`),
+pero **esta app no lo consulta**: búscalo directamente en tu casa de apuestas.
 
 ### ⚖️ Hándicap / Spread
 Se da una ventaja o desventaja ficticia a un equipo antes de empezar.
@@ -736,6 +1139,28 @@ Se da una ventaja o desventaja ficticia a un equipo antes de empezar.
 Apuestas a la suma total de goles, puntos o carreras.
 - **Más de 2.5 goles (Over):** se necesitan 3 o más goles.
 - **Menos de 2.5 goles (Under):** 0, 1 o 2 goles.
+
+### ➕ Mercados extra (opcionales en la barra lateral)
+- **Totales 1.ª mitad (`totals_h1`):** Over/Under pero solo con los goles o puntos de la primera mitad.
+  *Más de 0.5 (1.ª mitad)* = al menos un gol antes del descanso.
+- **Ambos equipos marcan (`btts`):** **Sí** si los dos equipos marcan al menos un gol; **No** si alguno se queda a cero. Solo fútbol.
+- **Totales por equipo (`team_totals`):** Over/Under con los goles o puntos de **un solo equipo**
+  (p. ej. *Real Madrid: Más de 1.5* = el Madrid marca 2 o más).
+
+**Cómo se consultan y cuánto cuestan:** a diferencia de 1X2, Over/Under y Hándicap, estos mercados no vienen en la
+consulta general: la API los sirve **partido a partido**, y cada mercado devuelto cuesta **1 crédito por región**.
+Por eso la app limita el número de partidos, te muestra el coste máximo y te pide confirmación antes de gastar créditos.
+Además, la cobertura es irregular (sobre todo en deportes de EE. UU. y en ciertas casas): si un mercado no está disponible
+para un partido, simplemente no aparece.
+
+### 🚫 Mercados que esta app no consulta: córners, tarjetas y rebotes
+- **Córners y tarjetas (fútbol):** la API los lista (`alternate_totals_corners`, `alternate_totals_cards`, `corners_1x2`…),
+  pero con cobertura muy limitada a unas pocas casas y competiciones.
+- **Rebotes y demás props de jugador (NBA):** existen (`player_rebounds`, `player_points`…), pero la cobertura se centra en
+  deportes y casas de EE. UU. (región `us`), y cada mercado cuesta créditos.
+- Con la región `eu` por defecto y un plan gratuito de 500 créditos al mes, consultarlos por partido sería muy caro y
+  casi siempre devolvería vacío, así que no están incluidos. Para ver la lista y la cobertura actuales, consulta la
+  documentación de The Odds API (apartado *Betting Markets*).
 
 ### 🧮 Cuota y probabilidad implícita
 - **Retorno** = importe × cuota · **Beneficio neto** = retorno − importe.
